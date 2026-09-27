@@ -4,6 +4,26 @@ export type CameraAngle = '正面' | '左侧 45°' | '右侧 45°' | '俯拍手�
 export type CaptionPosition = '下方安全区' | '上移 15%' | '角标提示' | '画面中央';
 export type GestureZone = '左侧' | '中央' | '右侧';
 
+/** 字幕语言：课堂主语言为简体中文，译文服务听人助教与家长 */
+export type SubtitleLanguage = '简体中文' | '繁體中文' | 'English' | '日本語';
+/** 字幕用途：说明该条字幕面向课堂、助教、家长还是角标提示 */
+export type SubtitlePurpose = '课堂讲解' | '听人助教辅助' | '家长协同' | '角标提示';
+
+export interface SubtitleTrack {
+  text: string;
+  language: SubtitleLanguage;
+  /** 该条字幕在步骤中的显示时长（秒），不应超过步骤总时长 */
+  displayDuration: number;
+  purpose: SubtitlePurpose;
+}
+
+export interface CaptionPair {
+  primary: SubtitleTrack;
+  translation: SubtitleTrack;
+  /** 译文是否已对照当前主字幕确认；主字幕文本一旦改动，译文保留但标记为待重新确认 */
+  translationConfirmed: boolean;
+}
+
 export interface LessonStep {
   id: string;
   title: string;
@@ -13,7 +33,8 @@ export interface LessonStep {
   demoUrl: string;
   handshape: string;
   gestureZone: GestureZone;
-  caption: string;
+  /** 双语字幕：主字幕 + 译文（由旧版 caption 字段迁移） */
+  captions: CaptionPair;
   captionPosition: CaptionPosition;
   camera: CameraAngle;
   commonMistakes: string[];
@@ -59,11 +80,70 @@ export interface ValidationCheck {
   severity: 'error' | 'warning' | 'info';
   title: string;
   detail: string;
+  /** 检查所属区域，预览面板只呈现字幕类检查 */
+  area?: 'caption' | 'general';
   stepId?: string;
   moduleId?: string;
 }
 
 export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v1';
+
+export const SUBTITLE_LANGUAGES: SubtitleLanguage[] = ['简体中文', '繁體中文', 'English', '日本語'];
+export const CAPTION_PURPOSES: SubtitlePurpose[] = ['课堂讲解', '听人助教辅助', '家长协同', '角标提示'];
+/** 单行字幕的最大显示宽度：CJK 全角字符记 1，半角字符记 0.55 */
+export const CAPTION_LINE_WIDTH_LIMIT = 20;
+
+export function createCaptionPair(
+  primaryText = '',
+  translationText = '',
+  translationLanguage: SubtitleLanguage = 'English',
+  stepDuration = 45,
+): CaptionPair {
+  return {
+    primary: { text: primaryText, language: '简体中文', displayDuration: stepDuration, purpose: '课堂讲解' },
+    translation: { text: translationText, language: translationLanguage, displayDuration: Math.min(stepDuration, 40), purpose: '听人助教辅助' },
+    translationConfirmed: false,
+  };
+}
+
+function isWideCharacter(char: string): boolean {
+  const code = char.codePointAt(0) ?? 0;
+  return (
+    (code >= 0x2e80 && code <= 0x9fff) ||   // CJK 部首与统一表意文字
+    (code >= 0x3000 && code <= 0x303f) ||   // CJK 标点
+    (code >= 0x3040 && code <= 0x30ff) ||   // 平假名、片假名
+    (code >= 0xac00 && code <= 0xd7a3) ||   // 韩文音节
+    (code >= 0xf900 && code <= 0xfaff) ||   // CJK 兼容表意文字
+    (code >= 0xff00 && code <= 0xffef)      // 全角字符
+  );
+}
+
+/** 估算字幕行的显示宽度（空白不计） */
+export function lineDisplayWidth(line: string): number {
+  let width = 0;
+  for (const char of line) {
+    if (/\s/.test(char)) continue;
+    width += isWideCharacter(char) ? 1 : 0.55;
+  }
+  return Math.round(width * 10) / 10;
+}
+
+/** 返回多行字幕中最长的一行及其宽度 */
+export function longestCaptionLine(text: string): { line: string; width: number } | undefined {
+  const lines = text.split('\n').filter((line) => line.trim());
+  if (!lines.length) return undefined;
+  return lines
+    .map((line) => ({ line, width: lineDisplayWidth(line) }))
+    .reduce((longest, current) => (current.width > longest.width ? current : longest));
+}
+
+export type CaptionTranslationState = 'complete' | 'stale' | 'missing';
+
+/** 译文状态：完整已确认 / 已保留但待重新确认 / 缺失 */
+export function captionTranslationState(captions: CaptionPair): CaptionTranslationState {
+  if (!captions.translation.text.trim()) return 'missing';
+  return captions.translationConfirmed ? 'complete' : 'stale';
+}
 
 export function createDemoProject(): CourseProject {
   const modules: CourseModule[] = [
@@ -82,7 +162,11 @@ export function createDemoProject(): CourseProject {
           demoUrl: '',
           handshape: '右手掌张开，拇指向上，自额头向外送出',
           gestureZone: '右侧',
-          caption: '你好：手掌从额前向前送出，同时保持微笑。',
+          captions: {
+            primary: { text: '你好：手掌从额前向前送出，同时保持微笑。', language: '简体中文', displayDuration: 35, purpose: '课堂讲解' },
+            translation: { text: 'Hello: sweep your open palm\nforward from your forehead, and smile.', language: 'English', displayDuration: 30, purpose: '听人助教辅助' },
+            translationConfirmed: true,
+          },
           captionPosition: '下方安全区',
           camera: '正面',
           commonMistakes: ['手掌过于僵硬', '没有视线交流'],
@@ -102,7 +186,11 @@ export function createDemoProject(): CourseProject {
           demoUrl: '',
           handshape: '四指并拢，拇指张开；掌心朝左前侧',
           gestureZone: '中央',
-          caption: '注意四指并拢，动作沿身体中轴向前。',
+          captions: {
+            primary: { text: '注意四指并拢，动作沿身体中轴向前。', language: '简体中文', displayDuration: 48, purpose: '课堂讲解' },
+            translation: { text: 'Keep your four fingers together.\nMove straight along the center.', language: 'English', displayDuration: 48, purpose: '家长协同' },
+            translationConfirmed: true,
+          },
           captionPosition: '画面中央',
           camera: '俯拍手部',
           commonMistakes: ['拇指贴住掌心', '动作方向偏向一侧'],
@@ -122,7 +210,12 @@ export function createDemoProject(): CourseProject {
           demoUrl: '',
           handshape: '保持标准手形，配合点头与视线交换',
           gestureZone: '中央',
-          caption: '轮流问候，每次动作结束后停一拍，再交换角色。',
+          // 主字幕刚调整过：译文仍保留但待重新确认，且译文行太长、显示时长超出步骤
+          captions: {
+            primary: { text: '轮流问候，结束后停一拍，再交换角色。', language: '简体中文', displayDuration: 75, purpose: '课堂讲解' },
+            translation: { text: 'Take turns greeting your partner, pause for a full beat after every sign, and then switch roles.', language: 'English', displayDuration: 90, purpose: '听人助教辅助' },
+            translationConfirmed: false,
+          },
           captionPosition: '上移 15%',
           camera: '全身远景',
           commonMistakes: ['动作过早结束', '两人视线没有相遇'],
@@ -150,7 +243,11 @@ export function createDemoProject(): CourseProject {
           demoUrl: '',
           handshape: '食指到五指依次展开，手心朝前',
           gestureZone: '中央',
-          caption: '数字一到五：从食指开始依次增加，不移动手腕。',
+          captions: {
+            primary: { text: '数字一到五：依次伸出手指，不移动手腕。', language: '简体中文', displayDuration: 60, purpose: '课堂讲解' },
+            translation: { text: '', language: 'English', displayDuration: 40, purpose: '听人助教辅助' },
+            translationConfirmed: false,
+          },
           captionPosition: '下方安全区',
           camera: '正面',
           commonMistakes: ['拇指遮挡手指数', '手腕左右摆动'],
@@ -170,7 +267,11 @@ export function createDemoProject(): CourseProject {
           demoUrl: '',
           handshape: '双手在胸前交替翻转，随后食指向前点出',
           gestureZone: '中央',
-          caption: '先做“钱”的交替手形，再用食指向前询问。',
+          captions: {
+            primary: { text: '先做"钱"的交替手形，再用食指向前询问。', language: '简体中文', displayDuration: 45, purpose: '课堂讲解' },
+            translation: { text: '', language: 'English', displayDuration: 40, purpose: '家长协同' },
+            translationConfirmed: false,
+          },
           captionPosition: '角标提示',
           camera: '右侧 45°',
           commonMistakes: ['两手动作不同步', '疑问表情缺失'],
@@ -200,6 +301,52 @@ export function createDemoProject(): CourseProject {
   };
 }
 
+/** 把旧版（或任意来源）步骤迁移为双语字幕结构，保留旧 caption 文本作为主字幕 */
+function normalizeStep(raw: Record<string, unknown>): LessonStep {
+  const {
+    caption: _legacyCaption,
+    ...rest
+  } = raw as Record<string, unknown> & { caption?: string };
+  const legacyCaption = typeof _legacyCaption === 'string' ? _legacyCaption : '';
+  const rawPair = (raw as { captions?: unknown }).captions as Partial<CaptionPair> | undefined;
+  const fallback = createCaptionPair(legacyCaption, '');
+  const captions: CaptionPair = rawPair
+    ? {
+        primary: { ...fallback.primary, ...(rawPair.primary ?? {}) },
+        translation: { ...fallback.translation, ...(rawPair.translation ?? {}) },
+        translationConfirmed: Boolean(rawPair.translationConfirmed),
+      }
+    : fallback;
+  return { ...(rest as Omit<LessonStep, 'captions' | 'caption'>), captions };
+}
+
+function normalizeModule(raw: Record<string, unknown>): CourseModule {
+  const module = raw as unknown as CourseModule;
+  return { ...module, steps: Array.isArray(module.steps) ? module.steps.map((step) => normalizeStep(step as unknown as Record<string, unknown>)) : [] };
+}
+
+/** 规范化本地草稿：迁移旧版单语字幕并补齐冻结快照，保证旧草稿也能继续编辑 */
+export function normalizeProject(source: unknown): CourseProject {
+  if (!source || typeof source !== 'object') return createDemoProject();
+  const project = structuredClone(source) as CourseProject;
+  if (!Array.isArray(project.modules)) project.modules = [];
+  project.modules = project.modules.map((module) => normalizeModule(module as unknown as Record<string, unknown>));
+  if (Array.isArray(project.frozenVersions)) {
+    project.frozenVersions = project.frozenVersions.map((version) => ({
+      ...version,
+      snapshot: {
+        ...version.snapshot,
+        modules: Array.isArray(version.snapshot?.modules)
+          ? version.snapshot.modules.map((module) => normalizeModule(module as unknown as Record<string, unknown>))
+          : [],
+      },
+    }));
+  } else {
+    project.frozenVersions = [];
+  }
+  return project;
+}
+
 export function selectedModule(project: CourseProject): CourseModule {
   return project.modules.find((module) => module.id === project.selectedModuleId) ?? project.modules[0];
 }
@@ -222,11 +369,47 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
       if (!step.altText.trim()) {
         checks.push({ id: `alt-${step.id}`, severity: 'error', title: `${step.title} 缺少替代文本`, detail: '示范片段需要描述手形、移动和面部表情。', stepId: step.id, moduleId: module.id });
       }
-      if (!step.caption.trim()) {
-        checks.push({ id: `caption-${step.id}`, severity: 'warning', title: `${step.title} 缺少字幕`, detail: '听障学习者在静音预览时无法获得说明。', stepId: step.id, moduleId: module.id });
+
+      // ── 双语字幕检查 ─────────────────────────────────────────────
+      const { primary, translation } = step.captions;
+      if (!primary.text.trim()) {
+        checks.push({ id: `caption-primary-${step.id}`, severity: 'warning', area: 'caption', title: `${step.title} 缺少主字幕`, detail: '听障学习者在静音预览时无法获得说明。', stepId: step.id, moduleId: module.id });
       }
+      const translationState = captionTranslationState(step.captions);
+      if (translationState === 'missing') {
+        checks.push({ id: `caption-translation-missing-${step.id}`, severity: 'error', area: 'caption', title: `${step.title} 缺少译文`, detail: '听人助教和家长看不懂主字幕时无法跟进，请补充译文后再提交复核。', stepId: step.id, moduleId: module.id });
+      } else if (translationState === 'stale') {
+        checks.push({ id: `caption-translation-stale-${step.id}`, severity: 'error', area: 'caption', title: `${step.title} 的译文待重新确认`, detail: '主字幕调整后译文已保留，但需要对照新主字幕重新确认。', stepId: step.id, moduleId: module.id });
+      }
+      ([['主字幕', primary], ['译文', translation]] as Array<[string, SubtitleTrack]>).forEach(([label, track]) => {
+        if (!track.text.trim()) return;
+        const longest = longestCaptionLine(track.text);
+        if (longest && longest.width > CAPTION_LINE_WIDTH_LIMIT) {
+          checks.push({
+            id: `caption-long-${label}-${step.id}`,
+            severity: 'warning',
+            area: 'caption',
+            title: `${step.title} 的${label}行太长`,
+            detail: `最长一行约 ${longest.width} 个全角字宽（上限 ${CAPTION_LINE_WIDTH_LIMIT}），手机端会折行或被裁切：“${longest.line.slice(0, 24)}${longest.line.length > 24 ? '…' : ''}”。`,
+            stepId: step.id,
+            moduleId: module.id,
+          });
+        }
+        if (track.displayDuration > step.duration) {
+          checks.push({
+            id: `caption-duration-${label}-${step.id}`,
+            severity: 'warning',
+            area: 'caption',
+            title: `${step.title} 的${label}显示时长超出步骤`,
+            detail: `${label}显示 ${track.displayDuration} 秒，但步骤只有 ${step.duration} 秒，字幕无法完整展示。`,
+            stepId: step.id,
+            moduleId: module.id,
+          });
+        }
+      });
+
       if (step.captionPosition === '画面中央' && (step.gestureZone === '中央' || step.camera === '俯拍手部')) {
-        checks.push({ id: `overlap-${step.id}`, severity: 'error', title: `${step.title} 字幕可能遮挡动作`, detail: `字幕位于${step.captionPosition}，而主要手形位于${step.gestureZone}。`, stepId: step.id, moduleId: module.id });
+        checks.push({ id: `overlap-${step.id}`, severity: 'error', area: 'caption', title: `${step.title} 字幕可能遮挡动作`, detail: `字幕位于${step.captionPosition}，而主要手形位于${step.gestureZone}。`, stepId: step.id, moduleId: module.id });
       }
       if (step.duration < 20) {
         checks.push({ id: `duration-${step.id}`, severity: 'warning', title: `${step.title} 时长过短`, detail: '示范与练习不足 20 秒，学习者来不及观察和跟做。', stepId: step.id, moduleId: module.id });
