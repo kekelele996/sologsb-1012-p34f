@@ -1,12 +1,23 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
+  CAPTION_LANGUAGES,
+  CAPTION_PURPOSES,
+  MAX_CAPTION_WIDTH,
+  captionWidth,
   cloneProject,
+  createCaptionTrack,
   createDemoProject,
+  isTranslationStale,
+  normalizeProject,
+  primarySignature,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
   validateProject,
   type CameraAngle,
+  type CaptionMode,
+  type CaptionPurpose,
+  type CaptionTrack,
   type CaptionPosition,
   type CourseModule,
   type CourseProject,
@@ -26,22 +37,32 @@ type PreviewSize = 'phone' | 'tablet';
 export class AppRoot {
   @State() project: CourseProject = createDemoProject();
   @State() previewSize: PreviewSize = 'phone';
+  @State() previewMode: CaptionMode = 'bilingual';
   @State() activePanel: 'editor' | 'checks' = 'editor';
   @State() playing = false;
   @State() playProgress = 0;
+  @State() batchLanguage = 'English';
+  @State() batchPurpose: CaptionPurpose = '听人助教参考';
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
+  /** 最近一次“批量套用语言”所在修订号，用于显示一键撤销。 */
+  private lastBatchRevision = 0;
 
   componentWillLoad(): void {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) this.project = JSON.parse(saved) as CourseProject;
+      if (saved) {
+        this.project = normalizeProject(JSON.parse(saved));
+      }
     } catch {
       this.project = createDemoProject();
     }
+    this.previewMode = this.project.captionSettings.previewMode;
+    this.batchLanguage = this.project.captionSettings.defaultTranslationLanguage;
+    this.batchPurpose = this.project.captionSettings.defaultTranslationPurpose;
   }
 
   disconnectedCallback(): void {
@@ -97,6 +118,10 @@ export class AppRoot {
     return validateProject(this.project);
   }
 
+  private captionChecks(stepId: string): ValidationCheck[] {
+    return this.checks.filter((check) => check.category === 'caption' && check.stepId === stepId);
+  }
+
   private persist(): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
@@ -122,6 +147,7 @@ export class AppRoot {
     if (!previous) return this.showToast('medium', '没有可撤销的修改。');
     this.future = [cloneProject(this.project), ...this.future].slice(0, 80);
     this.project = previous;
+    this.lastBatchRevision = 0;
     this.persist();
   }
 
@@ -151,6 +177,12 @@ export class AppRoot {
     this.persist();
   }
 
+  private setPreviewMode(mode: CaptionMode): void {
+    this.previewMode = mode;
+    this.project = { ...this.project, captionSettings: { ...this.project.captionSettings, previewMode: mode } };
+    this.persist();
+  }
+
   private updateStep(patch: Partial<LessonStep>, toast?: string): void {
     const stepId = this.currentStep?.id;
     if (!stepId) return;
@@ -161,6 +193,83 @@ export class AppRoot {
         steps: module.steps.map((step) => step.id === stepId ? { ...step, ...patch } : step),
       } : module),
     }), toast);
+  }
+
+  private patchCaption(which: 'primary' | 'translation', patch: Partial<CaptionTrack>): void {
+    const step = this.currentStep;
+    if (!step) return;
+    if (which === 'primary') {
+      // 主字幕调整时不触碰译文：译文保留，但因签名变化需要重新确认。
+      this.updateStep({ primaryCaption: { ...step.primaryCaption, ...patch } });
+      return;
+    }
+    const fallback = createCaptionTrack({
+      text: '',
+      language: this.project.captionSettings.defaultTranslationLanguage,
+      purpose: this.project.captionSettings.defaultTranslationPurpose,
+      durationSeconds: step.duration,
+      confirmed: false,
+      primarySignature: '',
+    });
+    const existing = step.translationCaption ?? fallback;
+    // 只要译文内容被改动，就回到“未确认”状态，等待教师重新确认。
+    this.updateStep({ translationCaption: { ...existing, ...patch, confirmed: false } });
+  }
+
+  private addTranslation(): void {
+    this.patchCaption('translation', {});
+  }
+
+  private confirmTranslation(): void {
+    const step = this.currentStep;
+    if (!step?.translationCaption) return;
+    this.updateStep({
+      translationCaption: {
+        ...step.translationCaption,
+        confirmed: true,
+        primarySignature: primarySignature(step.primaryCaption.text),
+      },
+    }, '译文已确认，可随主字幕一起提交复核。');
+  }
+
+  private removeTranslation(): void {
+    this.updateStep({ translationCaption: undefined }, '已移除该步骤的译文。');
+  }
+
+  /** 把选定的语言与用途一次性套用到全部步骤；缺译文的步骤建立空译文待填写。 */
+  private applyTranslationBatch(): void {
+    const language = this.batchLanguage;
+    const purpose = this.batchPurpose;
+    this.commit((draft) => {
+      draft.captionSettings = { ...draft.captionSettings, defaultTranslationLanguage: language, defaultTranslationPurpose: purpose };
+      draft.modules = draft.modules.map((module) => ({
+        ...module,
+        steps: module.steps.map((step) => {
+          const existing = step.translationCaption;
+          if (existing) {
+            return { ...step, translationCaption: { ...existing, language, purpose, confirmed: false } };
+          }
+          return {
+            ...step,
+            translationCaption: createCaptionTrack({
+              text: '',
+              language,
+              purpose,
+              durationSeconds: step.duration,
+              confirmed: false,
+              primarySignature: '',
+            }),
+          };
+        }),
+      }));
+      return draft;
+    }, `已把全部译文语言批量设为「${language}」，可撤销。`);
+    this.lastBatchRevision = this.project.revision;
+  }
+
+  private undoBatch(): void {
+    this.undo();
+    this.showToast('medium', '已撤销批量语言套用，各步骤恢复原语言与用途。');
   }
 
   private updateCurrentModule(patch: Partial<CourseModule>): void {
@@ -186,16 +295,25 @@ export class AppRoot {
     const module = this.currentModule;
     if (!module) return this.addModule();
     const prior = module.steps.at(-1);
+    const duration = 45;
+    const primaryText = '填写送给学习者的字幕说明。';
     const step: LessonStep = {
       id: `step-${Date.now().toString(36)}`,
       title: `新${kind}步骤 ${module.steps.length + 1}`,
       kind,
-      duration: 45,
+      duration,
       demoTitle: '等待上传或录制示范片段',
       demoUrl: '',
       handshape: '描述起始手形、掌心方向和运动路径。',
       gestureZone: '中央',
-      caption: '填写送给学习者的字幕说明。',
+      primaryCaption: createCaptionTrack({
+        text: primaryText,
+        language: '中文（简体）',
+        purpose: '课堂主讲',
+        durationSeconds: duration,
+        confirmed: true,
+        primarySignature: primarySignature(primaryText),
+      }),
       captionPosition: '下方安全区',
       camera: '正面',
       commonMistakes: [],
@@ -249,7 +367,7 @@ export class AppRoot {
       ...draft,
       modules: draft.modules.map((module) => {
         if (module.id !== draft.selectedModuleId) return module;
-        const index = module.steps.findIndex((step) => step.id === stepId);
+        const index = module.steps.findIndex((step) => step.id === step.id);
         const nextIndex = Math.max(0, Math.min(module.steps.length - 1, index + direction));
         if (index === nextIndex) return module;
         const steps = [...module.steps];
@@ -274,7 +392,7 @@ export class AppRoot {
     const blocking = this.checks.filter((check) => check.severity === 'error');
     if (blocking.length) {
       this.activePanel = 'checks';
-      this.showToast('danger', `仍有 ${blocking.length} 个阻断问题，修复后才能提交复核。`);
+      this.showToast('danger', `仍有 ${blocking.length} 个阻断问题（含未完成译文），修复后才能提交复核。`);
       return;
     }
     this.commit((draft) => ({ ...draft, status: 'review' }), '课程已提交复核。');
@@ -288,7 +406,7 @@ export class AppRoot {
     const blocking = this.checks.filter((check) => check.severity === 'error');
     if (blocking.length) {
       this.activePanel = 'checks';
-      this.showToast('danger', `冻结前仍有 ${blocking.length} 个阻断问题。`);
+      this.showToast('danger', `冻结前仍有 ${blocking.length} 个阻断问题（含未完成译文）。`);
       return;
     }
     this.commit((draft) => {
@@ -339,6 +457,19 @@ export class AppRoot {
     return <ion-badge color="medium">草稿</ion-badge>;
   }
 
+  private renderCaptionChip(step: LessonStep) {
+    const translation = step.translationCaption;
+    const stale = isTranslationStale(step);
+    if (!translation || !translation.text.trim()) {
+      return <span class="caption-chip danger">缺译文</span>;
+    }
+    if (stale || !translation.confirmed) {
+      return <span class="caption-chip warning">{stale ? '主字幕已改·待重认' : '待确认'}</span>;
+    }
+    const blocking = this.captionChecks(step.id).filter((check) => check.severity === 'error').length;
+    return <span class={`caption-chip ${blocking ? 'warning' : 'ok'}`}>{blocking ? '字幕异常' : '双语 ✓'}</span>;
+  }
+
   private renderStepListItem(step: LessonStep, index: number) {
     const active = step.id === this.currentStep?.id;
     const issueCount = this.checks.filter((check) => check.stepId === step.id && check.severity !== 'info').length;
@@ -347,10 +478,129 @@ export class AppRoot {
         <span class="step-index">{String(index + 1).padStart(2, '0')}</span>
         <span class="step-copy">
           <strong>{step.title}</strong>
-          <small>{step.kind} · {step.duration}s · {step.difficulty}</small>
+          <small>{step.kind} · {step.duration}s · {step.primaryCaption.language}</small>
+          {this.renderCaptionChip(step)}
         </span>
         {issueCount > 0 && <span class="step-issue-count">{issueCount}</span>}
       </button>
+    );
+  }
+
+  private renderLanguageSelect(value: string, frozen: boolean, onSelect: (language: string) => void) {
+    return (
+      <ion-select disabled={frozen} label="语言" labelPlacement="stacked" class="studio-input caption-field" value={value} onIonChange={(event) => onSelect(event.detail.value as string)}>
+        {CAPTION_LANGUAGES.map((language) => <ion-select-option value={language}>{language}</ion-select-option>)}
+      </ion-select>
+    );
+  }
+
+  private renderPurposeSelect(value: CaptionPurpose, frozen: boolean, onSelect: (purpose: CaptionPurpose) => void) {
+    return (
+      <ion-select disabled={frozen} label="用途" labelPlacement="stacked" class="studio-input caption-field" value={value} onIonChange={(event) => onSelect(event.detail.value as CaptionPurpose)}>
+        {CAPTION_PURPOSES.map((item) => <ion-select-option value={item.value}>{item.value}</ion-select-option>)}
+      </ion-select>
+    );
+  }
+
+  private renderWidthMeter(track: CaptionTrack, stepDuration: number) {
+    const width = captionWidth(track.text);
+    const overWidth = width > MAX_CAPTION_WIDTH;
+    const overDuration = track.durationSeconds > stepDuration;
+    return (
+      <div class="caption-meters">
+        <span class={`meter ${overWidth ? 'bad' : ''}`} title="按最长一行估算，全角字符记 2">行宽 {width}/{MAX_CAPTION_WIDTH}{overWidth ? ' · 太长' : ''}</span>
+        <span class={`meter ${overDuration ? 'bad' : ''}`} title="字幕显示时长 / 步骤时长">显示 {track.durationSeconds || 0}s / {stepDuration}s{overDuration ? ' · 超出步骤' : ''}</span>
+      </div>
+    );
+  }
+
+  private renderCaptionEditor(step: LessonStep, frozen: boolean) {
+    const primary = step.primaryCaption;
+    const translation = step.translationCaption;
+    const stale = isTranslationStale(step);
+    const translationIssues = this.captionChecks(step.id).filter((check) => check.id.startsWith('cap-translation'));
+    const translationState = !translation || !translation.text.trim()
+      ? 'missing'
+      : stale
+        ? 'stale'
+        : !translation.confirmed
+          ? 'unconfirmed'
+          : 'ready';
+
+    return (
+      <section class="form-card">
+        <div class="section-title"><span>03</span><div><h2>双语字幕编排</h2><p>每步维护主字幕与译文，记录语言、显示时长与用途</p></div></div>
+
+        <div class="form-grid two caption-position-row">
+          <ion-select disabled={frozen} label="字幕位置" labelPlacement="stacked" class="studio-input" value={step.captionPosition} onIonChange={(event) => this.updateStep({ captionPosition: event.detail.value as CaptionPosition })}>
+            {(['下方安全区', '上移 15%', '角标提示', '画面中央'] as CaptionPosition[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
+          </ion-select>
+          <ion-input disabled={frozen} label="替代文本状态" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText ? '已填写' : '缺失'} readonly />
+        </div>
+
+        <div class={`caption-track primary ${captionWidth(primary.text) > MAX_CAPTION_WIDTH || primary.durationSeconds > step.duration ? 'has-issue' : ''}`}>
+          <div class="caption-track-head">
+            <span class="caption-tag primary-tag">主字幕</span>
+            <div class="caption-fields">
+              {this.renderLanguageSelect(primary.language, frozen, (language) => this.patchCaption('primary', { language }))}
+              {this.renderPurposeSelect(primary.purpose, frozen, (purpose) => this.patchCaption('primary', { purpose }))}
+              <ion-input disabled={frozen} type="number" min="1" max="600" label="显示时长（秒）" labelPlacement="stacked" class="studio-input caption-field duration" value={String(primary.durationSeconds)} onIonInput={(event) => this.patchCaption('primary', { durationSeconds: Number(event.detail.value) || 0 })} />
+            </div>
+          </div>
+          <ion-textarea disabled={frozen} autoGrow label="主字幕文本" labelPlacement="stacked" class="studio-input" value={primary.text} placeholder="填写课堂主讲字幕" onIonInput={(event) => this.patchCaption('primary', { text: event.detail.value ?? '' })} />
+          {this.renderWidthMeter(primary, step.duration)}
+        </div>
+
+        <div class={`caption-track translation state-${translationState}`}>
+          {translation ? [
+            <div class="caption-track-head">
+              <span class="caption-tag translation-tag">译文</span>
+              <div class="caption-fields">
+                {this.renderLanguageSelect(translation.language, frozen, (language) => this.patchCaption('translation', { language }))}
+                {this.renderPurposeSelect(translation.purpose, frozen, (purpose) => this.patchCaption('translation', { purpose }))}
+                <ion-input disabled={frozen} type="number" min="1" max="600" label="显示时长（秒）" labelPlacement="stacked" class="studio-input caption-field duration" value={String(translation.durationSeconds)} onIonInput={(event) => this.patchCaption('translation', { durationSeconds: Number(event.detail.value) || 0 })} />
+              </div>
+            </div>,
+            <ion-textarea disabled={frozen} autoGrow label="译文文本" labelPlacement="stacked" class="studio-input" value={translation.text} placeholder="填写对应译文，供听人助教与家长阅读" onIonInput={(event) => this.patchCaption('translation', { text: event.detail.value ?? '' })} />,
+            this.renderWidthMeter(translation, step.duration),
+            <div class="translation-footer">
+              <span class={`confirm-state ${translationState}`}>
+                {translationState === 'missing' && '⚠ 译文为空，未完成前不能提交复核或冻结'}
+                {translationState === 'stale' && '⚠ 主字幕已调整，译文已保留但需重新确认'}
+                {translationState === 'unconfirmed' && '⚠ 译文经过修改，尚未确认'}
+                {translationState === 'ready' && `✓ 已确认 · 对应用途：${translation.purpose}`}
+              </span>
+              <span class="translation-actions">
+                <ion-button fill="outline" size="small" color="danger" class="studio-button" disabled={frozen} onClick={() => this.removeTranslation()}>移除译文</ion-button>
+                <ion-button fill="solid" size="small" color="primary" class="studio-button" disabled={frozen || translationState === 'ready'} onClick={() => this.confirmTranslation()}>确认译文</ion-button>
+              </span>
+            </div>,
+            translationIssues.length > 0 && (
+              <ul class="track-issue-list">
+                {translationIssues.map((check) => <li class={check.severity}>{check.title}：{check.detail}</li>)}
+              </ul>
+            ),
+          ] : (
+            <div class="translation-empty">
+              <div><strong>尚未编排译文</strong><p>听人助教和家长只能看到主字幕。添加译文后需要填写并确认，才能提交复核或冻结。</p></div>
+              <ion-button fill="outline" class="studio-button" disabled={frozen} onClick={() => this.addTranslation()}>＋ 添加译文（默认 {this.project.captionSettings.defaultTranslationLanguage}）</ion-button>
+            </div>
+          )}
+        </div>
+
+        <div class="caption-batch">
+          <div class="batch-copy">
+            <span class="caption-tag batch-tag">批量套用</span>
+            <p>把选定语言与用途一次性应用到全部步骤；已存在的译文只改语言/用途并回到待确认，缺译文的步骤建立空译文。操作可撤销。</p>
+          </div>
+          <div class="batch-controls">
+            {this.renderLanguageSelect(this.batchLanguage, frozen, (language) => { this.batchLanguage = language; })}
+            {this.renderPurposeSelect(this.batchPurpose, frozen, (purpose) => { this.batchPurpose = purpose; })}
+            <ion-button fill="solid" color="primary" class="studio-button" disabled={frozen} onClick={() => this.applyTranslationBatch()}>套用到全部步骤</ion-button>
+            <ion-button fill="outline" color="warning" class="studio-button" disabled={this.lastBatchRevision !== this.project.revision || this.past.length === 0} onClick={() => this.undoBatch()}>撤销批量套用</ion-button>
+          </div>
+        </div>
+      </section>
     );
   }
 
@@ -361,7 +611,7 @@ export class AppRoot {
         <div class="empty-editor">
           <div class="empty-glyph">手</div>
           <h2>这个模块还没有学习步骤</h2>
-          <p>添加示范、讲解或练习步骤，然后设置前置条件与难度。</p>
+          <p>添加示范、讲解或练习步骤，然后设置前置条件、难度与双语字幕。</p>
           <ion-button class="studio-button" onClick={() => this.addStep('示范')}>添加第一个步骤</ion-button>
         </div>
       );
@@ -432,20 +682,10 @@ export class AppRoot {
           <ion-textarea disabled={frozen} autoGrow label="手形说明" labelPlacement="stacked" class="studio-input" value={step.handshape} onIonInput={(event) => this.updateStep({ handshape: event.detail.value ?? '' })} />
         </section>
 
-        <section class="form-card">
-          <div class="section-title"><span>03</span><div><h2>字幕与无障碍</h2><p>检查字幕位置、动作遮挡与替代文本</p></div></div>
-          <div class="form-grid two">
-            <ion-select disabled={frozen} label="字幕位置" labelPlacement="stacked" class="studio-input" value={step.captionPosition} onIonChange={(event) => this.updateStep({ captionPosition: event.detail.value as CaptionPosition })}>
-              {(['下方安全区', '上移 15%', '角标提示', '画面中央'] as CaptionPosition[]).map((item) => <ion-select-option value={item}>{item}</ion-select-option>)}
-            </ion-select>
-            <ion-input disabled={frozen} label="替代文本状态" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText ? '已填写' : '缺失'} readonly />
-          </div>
-          <ion-textarea disabled={frozen} autoGrow label="步骤字幕" labelPlacement="stacked" class="studio-input" value={step.caption} onIonInput={(event) => this.updateStep({ caption: event.detail.value ?? '' })} />
-          <ion-textarea disabled={frozen} autoGrow label="替代文本（必须描述动作与表情）" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText} onIonInput={(event) => this.updateStep({ altText: event.detail.value ?? '' })} />
-        </section>
+        {this.renderCaptionEditor(step, frozen)}
 
         <section class="form-card">
-          <div class="section-title"><span>04</span><div><h2>学习依赖与练习</h2><p>前置步骤、常见错误、练习任务与反馈</p></div></div>
+          <div class="section-title"><span>04</span><div><h2>学习依赖、替代文本与练习</h2><p>前置步骤、替代文本、常见错误、练习任务与反馈</p></div></div>
           <div class="form-grid two">
             <ion-select disabled={frozen} label="前置条件" labelPlacement="stacked" class="studio-input" value={step.prerequisiteId} onIonChange={(event) => this.updateStep({ prerequisiteId: event.detail.value ?? '' })}>
               <ion-select-option value="">无前置条件</ion-select-option>
@@ -453,6 +693,7 @@ export class AppRoot {
             </ion-select>
             <ion-input disabled={frozen} label="检查点（秒，用逗号分隔）" labelPlacement="stacked" class="studio-input" value={step.cuePoints.join(', ')} onIonInput={(event) => this.updateStep({ cuePoints: (event.detail.value ?? '').split(/[,，\s]+/).map(Number).filter((value) => Number.isFinite(value)) })} />
           </div>
+          <ion-textarea disabled={frozen} autoGrow label="替代文本（必须描述动作与表情）" labelPlacement="stacked" class={`studio-input ${step.altText ? '' : 'ion-invalid'}`} value={step.altText} onIonInput={(event) => this.updateStep({ altText: event.detail.value ?? '' })} />
           <ion-textarea disabled={frozen} autoGrow label="常见错误（每行一条）" labelPlacement="stacked" class="studio-input" value={step.commonMistakes.join('\n')} onIonInput={(event) => this.updateStep({ commonMistakes: (event.detail.value ?? '').split('\n').filter(Boolean) })} />
           <div class="form-grid two">
             <ion-textarea disabled={frozen} autoGrow label="练习任务" labelPlacement="stacked" class="studio-input" value={step.exercise} onIonInput={(event) => this.updateStep({ exercise: event.detail.value ?? '' })} />
@@ -463,17 +704,67 @@ export class AppRoot {
     );
   }
 
+  private renderPreviewCaptionLines(step: LessonStep) {
+    const mode = this.previewMode;
+    const primary = step.primaryCaption;
+    const translation = step.translationCaption;
+    const showPrimary = mode === 'primary' || mode === 'bilingual';
+    const showTranslation = mode === 'bilingual' || mode === 'translation';
+    const primaryOver = primary.durationSeconds > step.duration;
+    const primaryLong = captionWidth(primary.text) > MAX_CAPTION_WIDTH;
+    const translationMissing = !translation || !translation.text.trim();
+    const translationStale = isTranslationStale(step);
+    const translationOver = translation ? translation.durationSeconds > step.duration : false;
+    const translationLong = translation ? captionWidth(translation.text) > MAX_CAPTION_WIDTH : false;
+
+    const lineClass = (long: boolean, over: boolean, missing = false) =>
+      `caption-line ${long ? 'line-long' : ''} ${over ? 'line-over' : ''} ${missing ? 'line-missing' : ''}`;
+
+    return (
+      <div class={`caption-stack mode-${mode}`}>
+        {showPrimary && (
+          <div class={lineClass(primaryLong, primaryOver, !primary.text.trim())}>
+            <span class="line-lang">{primary.language}</span>
+            <span class="line-text">{primary.text.trim() || '未填写主字幕'}</span>
+            <span class="line-duration">{primary.durationSeconds || 0}s/{step.duration}s</span>
+          </div>
+        )}
+        {showTranslation && (translation ? (
+          <div class={lineClass(translationLong, translationOver, translationMissing)}>
+            <span class="line-lang">{translation.language}{translationStale || !translation.confirmed ? ' · 待确认' : ''}</span>
+            <span class="line-text">{translation.text.trim() || '译文缺失，请回到编排区填写'}</span>
+            <span class="line-duration">{translation.durationSeconds || 0}s/{step.duration}s</span>
+          </div>
+        ) : (
+          <div class="caption-line line-missing">
+            <span class="line-lang">译文</span>
+            <span class="line-text">译文缺失：听人助教和家长无法跟读</span>
+            <span class="line-duration">—</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   private renderPreview() {
     const step = this.currentStep;
     const progress = Math.round(this.playProgress * 100);
+    const captionIssues = step ? this.captionChecks(step.id) : [];
     return (
       <section class="preview-panel">
         <div class="preview-head">
-          <div><span class="eyebrow">学习者预览</span><h2>设备与安全区检查</h2></div>
-          <ion-segment value={this.previewSize} class="studio-segment" onIonChange={(event) => { this.previewSize = event.detail.value as PreviewSize; }}>
-            <ion-segment-button value="phone">手机</ion-segment-button>
-            <ion-segment-button value="tablet">平板</ion-segment-button>
-          </ion-segment>
+          <div><span class="eyebrow">学习者预览</span><h2>设备、安全区与双语字幕</h2></div>
+          <div class="preview-segments">
+            <ion-segment value={this.previewMode} class="studio-segment caption-mode-segment" onIonChange={(event) => { this.setPreviewMode(event.detail.value as CaptionMode); }}>
+              <ion-segment-button value="primary">主字幕</ion-segment-button>
+              <ion-segment-button value="bilingual">双语</ion-segment-button>
+              <ion-segment-button value="translation">仅译文</ion-segment-button>
+            </ion-segment>
+            <ion-segment value={this.previewSize} class="studio-segment" onIonChange={(event) => { this.previewSize = event.detail.value as PreviewSize; }}>
+              <ion-segment-button value="phone">手机</ion-segment-button>
+              <ion-segment-button value="tablet">平板</ion-segment-button>
+            </ion-segment>
+          </div>
         </div>
         {step ? (
           <div class={`device-frame ${this.previewSize}`}>
@@ -487,14 +778,27 @@ export class AppRoot {
                 <div class="arm arm-right"><span class="hand" /></div>
               </div>
               <div class="gesture-marker" style={{ left: step.gestureZone === '左侧' ? '18%' : step.gestureZone === '右侧' ? '70%' : '43%' }} />
-              <div class="caption-preview">{step.caption || '未填写字幕'}</div>
-              {step.captionPosition === '角标提示' && <div class="corner-caption">{step.caption.slice(0, 18) || '角标提示'}</div>}
+              <div class="caption-preview">
+                {this.previewMode === 'translation' && step.translationCaption
+                  ? (step.translationCaption.text.trim() || '译文缺失，请回到编排区填写')
+                  : (step.primaryCaption.text.trim() || '未填写主字幕')}
+              </div>
+              {step.captionPosition === '角标提示' && (
+                <div class="corner-caption">
+                  {this.previewMode === 'translation'
+                    ? ((step.translationCaption?.text ?? '译文缺失').slice(0, 24) || '译文缺失')
+                    : step.primaryCaption.text.slice(0, 18) || '角标提示'}
+                </div>
+              )}
               <div class="safe-area"><span>字幕安全区</span></div>
             </div>
             <div class="player-controls">
               <button class="play-button" onClick={() => this.togglePlay()}>{this.playing ? 'Ⅱ' : '▶'}</button>
               <div class="player-timeline">
                 <span style={{ width: `${progress}%` }} />
+                {step.primaryCaption.durationSeconds > 0 && step.primaryCaption.durationSeconds <= step.duration && (
+                  <b class="caption-range" style={{ left: '0%', width: `${Math.min(100, (step.primaryCaption.durationSeconds / Math.max(1, step.duration)) * 100)}%` }} title={`主字幕显示 ${step.primaryCaption.durationSeconds}s`} />
+                )}
                 {step.cuePoints.map((cue) => <i style={{ left: `${Math.min(100, (cue / Math.max(1, step.duration)) * 100)}%` }} title={`检查点 ${cue}s`} />)}
               </div>
               <span class="time-code">{String(Math.floor(this.playProgress * step.duration)).padStart(2, '0')} / {step.duration}s</span>
@@ -503,8 +807,25 @@ export class AppRoot {
               <div><strong>{step.kind}</strong><span>步骤类型</span></div>
               <div><strong>{step.difficulty}</strong><span>难度标签</span></div>
               <div><strong>{step.cuePoints.length}</strong><span>检查点</span></div>
+              <div><strong>{step.translationCaption?.confirmed && !isTranslationStale(step) ? '已确认' : '未就绪'}</strong><span>双语状态</span></div>
             </div>
-            <p class="preview-caption-text">{step.caption}</p>
+            <div class="preview-transcript">
+              <div class="transcript-head">
+                <span>{this.previewMode === 'primary' ? '主字幕视图' : this.previewMode === 'translation' ? '仅译文视图' : '双语视图'}</span>
+                <span>{step.translationCaption?.language ?? '未编排译文'}</span>
+              </div>
+              {this.renderPreviewCaptionLines(step)}
+            </div>
+            {captionIssues.length > 0 && (
+              <div class="preview-caption-warnings">
+                {captionIssues.map((check) => (
+                  <button class={check.severity} onClick={() => { this.activePanel = 'editor'; }}>
+                    <span>{check.severity === 'error' ? '!' : check.severity === 'warning' ? '△' : 'i'}</span>
+                    {check.title}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ) : <div class="empty-preview">选择步骤后显示设备预览。</div>}
       </section>
@@ -515,6 +836,21 @@ export class AppRoot {
     const errors = this.checks.filter((check) => check.severity === 'error');
     const warnings = this.checks.filter((check) => check.severity === 'warning');
     const info = this.checks.filter((check) => check.severity === 'info');
+    const captionChecks = this.checks.filter((check) => check.category === 'caption');
+    const generalChecks = this.checks.filter((check) => check.category !== 'caption');
+
+    const renderItem = (check: ValidationCheck) => (
+      <button class={`check-item ${check.severity}`} onClick={() => {
+        if (check.moduleId) this.selectModule(check.moduleId);
+        if (check.stepId) this.selectStep(check.stepId);
+        this.activePanel = 'editor';
+      }}>
+        <span class="check-severity">{check.severity === 'error' ? '!' : check.severity === 'warning' ? '△' : 'i'}</span>
+        <span><strong>{check.title}</strong><small>{check.detail}</small></span>
+        <span class="check-arrow">→</span>
+      </button>
+    );
+
     return (
       <section class="checks-panel">
         <div class="checks-summary">
@@ -523,18 +859,25 @@ export class AppRoot {
           <div class="check-stat"><strong>{info.length}</strong><span>优化建议</span></div>
         </div>
         <div class="check-list">
-          {this.checks.length === 0 && <div class="all-clear"><strong>✓ 未发现问题</strong><p>字幕遮挡、步骤跳级和替代文本检查均已通过。</p></div>}
-          {this.checks.map((check) => (
-            <button class={`check-item ${check.severity}`} onClick={() => {
-              if (check.moduleId) this.selectModule(check.moduleId);
-              if (check.stepId) this.selectStep(check.stepId);
-              this.activePanel = 'editor';
-            }}>
-              <span class="check-severity">{check.severity === 'error' ? '!' : check.severity === 'warning' ? '△' : 'i'}</span>
-              <span><strong>{check.title}</strong><small>{check.detail}</small></span>
-              <span class="check-arrow">→</span>
-            </button>
-          ))}
+          {this.checks.length === 0 && <div class="all-clear"><strong>✓ 未发现问题</strong><p>双语字幕、字幕遮挡、步骤跳级和替代文本检查均已通过。</p></div>}
+          {captionChecks.length > 0 && (
+            <div class="check-group">
+              <div class="check-group-head">
+                <span class="caption-tag primary-tag">双语字幕</span>
+                <small>{captionChecks.filter((check) => check.severity === 'error').length} 个阻断 · {captionChecks.filter((check) => check.severity === 'warning').length} 个提醒</small>
+              </div>
+              {captionChecks.map(renderItem)}
+            </div>
+          )}
+          {generalChecks.length > 0 && (
+            <div class="check-group">
+              <div class="check-group-head">
+                <span class="eyebrow">课程与无障碍</span>
+                <small>{generalChecks.filter((check) => check.severity === 'error').length} 个阻断 · {generalChecks.filter((check) => check.severity === 'warning').length} 个提醒</small>
+              </div>
+              {generalChecks.map(renderItem)}
+            </div>
+          )}
         </div>
       </section>
     );
@@ -543,6 +886,7 @@ export class AppRoot {
   render() {
     const module = this.currentModule;
     const errors = this.checks.filter((check) => check.severity === 'error').length;
+    const captionBlocking = this.checks.filter((check) => check.category === 'caption' && check.severity === 'error').length;
     return (
       <Host>
         <ion-app>
@@ -577,6 +921,7 @@ export class AppRoot {
                 <div><strong>{this.project.modules.reduce((sum, item) => sum + item.steps.length, 0)}</strong><span>步骤</span></div>
                 <div><strong>{Math.ceil(this.project.modules.reduce((sum, item) => sum + item.steps.reduce((total, lesson) => total + lesson.duration, 0), 0) / 60)}</strong><span>分钟</span></div>
                 <div class={errors ? 'has-errors' : ''}><strong>{errors}</strong><span>阻断问题</span></div>
+                <div class={captionBlocking ? 'has-errors' : ''}><strong>{captionBlocking}</strong><span>字幕阻断</span></div>
               </div>
               <div class="workflow-actions">
                 {this.project.status === 'review' && <ion-button fill="clear" color="danger" class="studio-button" onClick={() => this.returnForChanges()}>退回修改</ion-button>}

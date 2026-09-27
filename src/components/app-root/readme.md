@@ -10,11 +10,11 @@
 ### Depends on
 
 - ion-badge
-- ion-button
-- ion-input
 - ion-select
 - ion-select-option
+- ion-input
 - ion-textarea
+- ion-button
 - ion-segment
 - ion-segment-button
 - ion-app
@@ -28,11 +28,11 @@
 ```mermaid
 graph TD;
   app-root --> ion-badge
-  app-root --> ion-button
-  app-root --> ion-input
   app-root --> ion-select
   app-root --> ion-select-option
+  app-root --> ion-input
   app-root --> ion-textarea
+  app-root --> ion-button
   app-root --> ion-segment
   app-root --> ion-segment-button
   app-root --> ion-app
@@ -41,8 +41,6 @@ graph TD;
   app-root --> ion-buttons
   app-root --> ion-content
   app-root --> ion-toast
-  ion-button --> ion-ripple-effect
-  ion-input --> ion-icon
   ion-select --> ion-select-popover
   ion-select --> ion-popover
   ion-select --> ion-action-sheet
@@ -76,7 +74,9 @@ graph TD;
   ion-select-modal --> ion-button
   ion-select-modal --> ion-content
   ion-select-modal --> ion-list
+  ion-button --> ion-ripple-effect
   ion-modal --> ion-backdrop
+  ion-input --> ion-icon
   ion-segment-button --> ion-ripple-effect
   ion-toast --> ion-icon
   ion-toast --> ion-ripple-effect
